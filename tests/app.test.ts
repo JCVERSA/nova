@@ -266,6 +266,7 @@ const zipai: BotCommand = {
 
 export default zipai;
 `;
+    fs.mkdirSync(commandsDir, { recursive: true });
     fs.writeFileSync(path.join(commandsDir, "zipai.ts"), aiLike, "utf-8");
 
     const res = await request(app).get("/api/bot/download-zip").set(auth).responseType("arraybuffer");
