@@ -84,6 +84,11 @@ function writeEnvFile(lines: string[]): boolean {
 
 /** Sets a secret: applies it to the running process and persists it to .env. */
 export function setSecret(name: SecretName, value: string): { applied: boolean; fileSaved: boolean } {
+  // A newline in the value would let a caller write extra env assignments.
+  if (/[\r\n]/.test(value)) {
+    console.warn("[Secrets] Rejected value containing newline characters.");
+    return { applied: false, fileSaved: false };
+  }
   process.env[name] = value;
 
   const lines = readEnvLines();

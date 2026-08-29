@@ -1,9 +1,15 @@
 import { BotCommand } from "../types.js";
-import { isSafeDownloadUrl, safeFetch } from "../urlSafety.js";
+import { isSafeDownloadUrl, safeFetch, safeFetchToFile } from "../urlSafety.js";
 import { registerTempDownload } from "../tempDownloadManager.js";
 import fs from "fs";
 import path from "path";
 import os from "os";
+
+// Hard caps: never buffer more than this in memory; larger files stream to a
+// temp file and are handed out as time-limited links.
+const DIRECT_MEDIA_MAX_MB = 100;
+const BUFFER_MAX_BYTES = 60 * 1024 * 1024;
+const STREAM_MAX_BYTES = 500 * 1024 * 1024;
 
 // List of public robust Cobalt instances for high-reliability fallback waterfall
 const COBALT_INSTANCES = [
@@ -164,22 +170,22 @@ const downloadCommand: BotCommand = {
       // Handle direct file download
       if (downloadUrl) {
         console.log(`[Downloader] Downloading direct file from: ${downloadUrl}`);
-        
-        // Fetch the file buffer (SSRF-safe: validates every redirect hop)
-        const fileRes = await safeFetch(downloadUrl);
-        if (!fileRes.ok) throw new Error(`HTTP error! status: ${fileRes.status}`);
-        
-        const arrayBuffer = await fileRes.arrayBuffer();
-        const fileBuffer = Buffer.from(arrayBuffer);
 
-        const fileSizeMB = fileBuffer.length / (1024 * 1024);
-        if (fileSizeMB > 100) {
+        // Stream to disk (SSRF-safe with pinned DNS, byte cap and timeout).
+        const tempFilename = `nebula_download_${Date.now()}${audioOnly ? ".mp3" : ".mp4"}`;
+        const tempPath = path.join(os.tmpdir(), tempFilename);
+        const streamResult = await safeFetchToFile(downloadUrl, tempPath, {
+          maxBytes: STREAM_MAX_BYTES,
+          timeoutMs: 120_000,
+        });
+        if (!streamResult.ok) {
+          throw new Error(streamResult.error || `HTTP error! status: ${streamResult.status}`);
+        }
+        const fileSizeMB = streamResult.sizeBytes / (1024 * 1024);
+
+        // Over WhatsApp's limit → time-limited secure link (no in-memory copy).
+        if (fileSizeMB > DIRECT_MEDIA_MAX_MB) {
           await context.react("🚀");
-          const tempExt = audioOnly ? ".mp3" : ".mp4";
-          const tempFilename = `nebula_download_${Date.now()}${tempExt}`;
-          const tempPath = path.join(os.tmpdir(), tempFilename);
-          fs.writeFileSync(tempPath, fileBuffer);
-
           const tempDownload = registerTempDownload(tempPath, tempFilename, {
             mimeType: audioOnly ? "audio/mpeg" : "video/mp4",
             ttlMinutes: 120,
@@ -197,27 +203,34 @@ const downloadCommand: BotCommand = {
           );
         }
 
+        // In-limit: read into a buffer for WhatsApp delivery.
+        const fileBuffer = fs.readFileSync(tempPath);
+
         // Send media based on mode
-        if (audioOnly) {
-          await sock.sendMessage(msg.key.remoteJid, {
-            audio: fileBuffer,
-            mimetype: "audio/mp4",
-            ptt: false
-          }, { quoted: msg });
-        } else if (fileSizeMB <= 50) {
-          await sock.sendMessage(msg.key.remoteJid, {
-            video: fileBuffer,
-            caption: `✅ *Media successfully downloaded!*`,
-            mimetype: "video/mp4"
-          }, { quoted: msg });
-        } else {
-          // 50MB - 100MB send as document
-          await sock.sendMessage(msg.key.remoteJid, {
-            document: fileBuffer,
-            mimetype: "video/mp4",
-            fileName: `nebula_video_${Date.now()}.mp4`,
-            caption: `✅ *Media successfully downloaded (${fileSizeMB.toFixed(1)} MB)!*`
-          }, { quoted: msg });
+        try {
+          if (audioOnly) {
+            await sock.sendMessage(msg.key.remoteJid, {
+              audio: fileBuffer,
+              mimetype: "audio/mp4",
+              ptt: false
+            }, { quoted: msg });
+          } else if (fileSizeMB <= 50) {
+            await sock.sendMessage(msg.key.remoteJid, {
+              video: fileBuffer,
+              caption: `✅ *Media successfully downloaded!*`,
+              mimetype: "video/mp4"
+            }, { quoted: msg });
+          } else {
+            // 50MB - 100MB send as document
+            await sock.sendMessage(msg.key.remoteJid, {
+              document: fileBuffer,
+              mimetype: "video/mp4",
+              fileName: `nebula_video_${Date.now()}.mp4`,
+              caption: `✅ *Media successfully downloaded (${fileSizeMB.toFixed(1)} MB)!*`
+            }, { quoted: msg });
+          }
+        } finally {
+          fs.unlinkSync(tempPath);
         }
         await context.react("✅");
       } 
@@ -228,7 +241,7 @@ const downloadCommand: BotCommand = {
         const limit = Math.min(pickerUrls.length, 3);
         for (let i = 0; i < limit; i++) {
           const itemUrl = pickerUrls[i];
-          const fileRes = await safeFetch(itemUrl);
+          const fileRes = await safeFetch(itemUrl, {}, 5, { maxBytes: BUFFER_MAX_BYTES, timeoutMs: 90_000 });
           if (fileRes.ok) {
             const arrayBuffer = await fileRes.arrayBuffer();
             const fileBuffer = Buffer.from(arrayBuffer);

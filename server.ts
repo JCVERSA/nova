@@ -7,6 +7,25 @@ import { createApp } from "./app.js";
 import { initRegistry } from "./src/bot/commandRegistry.js";
 import { addLog } from "./src/bot/botEngine.js";
 
+// ---------------------------------------------------------------------------
+// Process-level resilience: a single failed background network promise (e.g.
+// a scraper's eager data fetch) must never take the whole panel down. Log it
+// loudly instead. Uncaught synchronous exceptions still terminate the
+// process — that is deliberate and keeps crashes observable via the runtime.
+// ---------------------------------------------------------------------------
+let lastRejectionLog = 0;
+
+process.on("unhandledRejection", (reason: unknown) => {
+  const now = Date.now();
+  if (now - lastRejectionLog < 5000) return; // rate-limit repeated failures
+  lastRejectionLog = now;
+  const message = reason instanceof Error ? reason.message : String(reason);
+  console.error(`[UnhandledRejection] ${message}`);
+  if (reason instanceof Error && reason.stack) {
+    console.error(reason.stack.split("\n").slice(0, 6).join("\n"));
+  }
+});
+
 // Start dev server with Vite in full-stack mode
 async function startServer() {
   // Build the command registry (built-ins + commands on disk) before serving.

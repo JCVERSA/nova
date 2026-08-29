@@ -75,17 +75,10 @@ export function detectLinks(text: string): LinkDetectionResult {
 export function isPotentialBot(msg: any, senderJid: string, text: string): boolean {
   if (!msg || !senderJid) return false;
 
-  // Check if message ID format contains known bot prefixes (e.g., 3EB0, 3EB, B1E, etc.)
-  const msgId = msg.key?.id || "";
-  if (
-    msgId.startsWith("3EB0") ||
-    msgId.startsWith("BAE5") ||
-    msgId.startsWith("XYZ") ||
-    msgId.length === 32
-  ) {
-    return true;
-  }
-
+  // NOTE: message-ID heuristics were removed — WhatsApp message IDs are
+  // 32-char hex strings that routinely begin with 3EB0/BAE5, so matching on
+  // them flagged and deleted ordinary human messages whenever antibot was
+  // enabled. Detection now relies on message-shape and command-prefix signals.
   // Check if message has multiple bot button responses or automation flags
   if (
     msg.message?.templateButtonReplyMessage ||

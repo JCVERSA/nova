@@ -19,6 +19,12 @@ export interface TempDownloadRecord {
 const TEMP_DOWNLOAD_DIR = path.join(os.tmpdir(), "nebula_temp_downloads");
 const ZIP_MAX_AGE_MS = 60 * 60 * 1000; // 60 minutes maximum retention for generated ZIP files
 
+// Storage safety ceilings — an untrusted WhatsApp user must not be able to
+// fill the host disk via temp downloads.
+const TEMP_MAX_TOTAL_BYTES = Number(process.env.NEBULA_TEMP_MAX_BYTES || 4 * 1024 * 1024 * 1024); // 4 GB
+const TEMP_MAX_RECORDS = 200;
+const ORPHAN_MAX_AGE_MS = 3 * 60 * 60 * 1000; // hard sweep for any orphan > 3h
+
 // Ensure base temp directory exists
 try {
   fs.mkdirSync(TEMP_DOWNLOAD_DIR, { recursive: true });
@@ -101,6 +107,15 @@ export function registerTempDownload(
   const mimeType = options?.mimeType || (isZip ? "application/zip" : filename.endsWith(".mp4") ? "video/mp4" : "application/octet-stream");
 
   // Secure unguessable 48-char random token
+  // Enforce global storage ceilings before copying anything to disk.
+  const currentTotal = getTempStorageStats().totalMB * 1024 * 1024;
+  if (activeDownloads.size >= TEMP_MAX_RECORDS) {
+    throw new Error("Temporary download storage is full (record limit). Please try again later.");
+  }
+  if (currentTotal + sizeBytes > TEMP_MAX_TOTAL_BYTES) {
+    throw new Error("Temporary download storage quota reached. Please try again later.");
+  }
+
   const token = crypto.randomBytes(24).toString("hex");
   const sanitizedName = filename.replace(/[^a-zA-Z0-9._-]/g, "_");
   const destinationPath = path.join(TEMP_DOWNLOAD_DIR, `${token}_${sanitizedName}`);
@@ -210,24 +225,26 @@ export function cleanupExpiredZipFiles(): { cleanedFiles: number; freedBytes: nu
     }
   }
 
-  // 2. Scan TEMP_DOWNLOAD_DIR for any orphaned .zip files older than 60 minutes
+  // 2. Scan TEMP_DOWNLOAD_DIR for orphaned files: ZIPs older than 60 min,
+  // any other file older than 3h (safety net for records that were never
+  // accessed after their TTL expired).
   try {
     if (fs.existsSync(TEMP_DOWNLOAD_DIR)) {
       const files = fs.readdirSync(TEMP_DOWNLOAD_DIR);
       for (const file of files) {
-        if (file.toLowerCase().endsWith(".zip")) {
-          const fullPath = path.join(TEMP_DOWNLOAD_DIR, file);
-          try {
-            const stats = fs.statSync(fullPath);
-            const ageMs = now - stats.mtimeMs;
-            if (ageMs >= ZIP_MAX_AGE_MS) {
-              freedBytes += stats.size;
-              fs.unlinkSync(fullPath);
-              cleanedFiles++;
-              console.log(`[TempDownload] 🧹 Purged orphaned ZIP from temp storage: ${file} (Age: ${Math.round(ageMs / 60000)}m)`);
-            }
-          } catch {}
-        }
+        const fullPath = path.join(TEMP_DOWNLOAD_DIR, file);
+        try {
+          const stats = fs.statSync(fullPath);
+          const ageMs = now - stats.mtimeMs;
+          const isZip = file.toLowerCase().endsWith(".zip");
+          const maxAge = isZip ? ZIP_MAX_AGE_MS : ORPHAN_MAX_AGE_MS;
+          if (ageMs >= maxAge) {
+            freedBytes += stats.size;
+            fs.unlinkSync(fullPath);
+            cleanedFiles++;
+            console.log(`[TempDownload] 🧹 Purged orphaned file from temp storage: ${file} (Age: ${Math.round(ageMs / 60000)}m)`);
+          }
+        } catch {}
       }
     }
   } catch (err: any) {

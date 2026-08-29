@@ -1,5 +1,6 @@
 import { BotCommand } from "../types.js";
 import { generateImageWithFallback } from "../geminiClient.js";
+import { checkAIQuota, consumeAIQuota, withAIConcurrency } from "../aiQuota.js";
 
 const imageCommand: BotCommand = {
   name: "image",
@@ -25,6 +26,12 @@ const imageCommand: BotCommand = {
       return;
     }
 
+    const quota = checkAIQuota(context.sender);
+    if (!quota.allowed) {
+      await context.reply(`⚠️ ${quota.error}`);
+      return;
+    }
+
     try {
       // Try downloading media if the user quoted/replied to an image
       let inputImageBase64: string | undefined;
@@ -36,7 +43,13 @@ const imageCommand: BotCommand = {
         }
       }
 
-      const result = await generateImageWithFallback(prompt, inputImageBase64);
+      consumeAIQuota(context.sender);
+      const result = await withAIConcurrency(() => generateImageWithFallback(prompt, inputImageBase64));
+      // M11: when Gemini is unavailable the prompt is sent to a third-party
+      // public service — say so explicitly before handing out the URL.
+      if (result && result.mode === "fallback") {
+        await context.reply("ℹ️ *Heads up:* Gemini is unavailable right now, so your prompt is being sent to a third-party public image service (Pollinations) to generate the result.");
+      }
 
       if (result.mode === "fallback") {
         await context.reply(

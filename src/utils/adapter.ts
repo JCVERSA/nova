@@ -1,4 +1,5 @@
 import { BotCommandContext } from "../bot/types.js";
+import { getConfig } from "../bot/config.js";
 
 /**
  * Adapter Bridge Utility - Normalizes external message, sender, group,
@@ -82,10 +83,16 @@ export function buildAdapterContext(
   
   const from = normalized.from;
   const sender = normalized.sender;
-  const isOwner = sender.startsWith("447") || sender.startsWith("33") || rawMsg.key?.fromMe || false; // flexible owner check
+
+  // Owner = configured OWNER_NUMBER (digits-only comparison) or a self-sent
+  // message. Country-prefix heuristics (H7) would have made every UK/French
+  // number an owner — that hole is closed.
+  const configuredOwner = String(getConfig().ownerNumber || "").replace(/[^0-9]/g, "");
+  const senderDigits = sender.replace(/[^0-9]/g, "");
+  const isOwner = (configuredOwner.length > 0 && senderDigits === configuredOwner) || rawMsg.key?.fromMe === true;
 
   const bodyText = normalized.text;
-  const prefix = ".";
+  const prefix = getConfig().prefix || ".";
   const words = bodyText.slice(prefix.length).trim().split(/\s+/);
   const commandName = customArgs ? "" : (words.shift()?.toLowerCase() || "");
   const args = customArgs || words;

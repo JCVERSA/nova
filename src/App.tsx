@@ -71,6 +71,8 @@ import Loader from "./components/Loader";
 import Switch from "./components/Switch";
 import { BrowserIdentitySelector } from "./components/BrowserIdentitySelector";
 import { BatchDownloadStatus } from "./components/BatchDownloadStatus";
+import AccessControlPanel from "./components/AccessControlPanel";
+import SecurityExtras from "./components/SecurityExtras";
 
 type TabId = NavTab;
 
@@ -138,9 +140,9 @@ function Card({ title, icon: Icon, action, children, className = "" }: { title?:
 
 export default function App() {
   // ------------------------------------------------------------------ state
-  const [panelToken, setPanelToken] = useState<string | null>(() => {
-    return sessionStorage.getItem("panel_token");
-  });
+  const [isAuthenticated, setIsAuthenticated] = useState<boolean | null>(null);
+  const [loginError, setLoginError] = useState<string | null>(null);
+  const [isLoggingIn, setIsLoggingIn] = useState(false);
   const [activeTab, setActiveTab] = useState<TabId>("overview");
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [quickTerminalOpen, setQuickTerminalOpen] = useState(false);
@@ -383,28 +385,62 @@ export default function App() {
   // ------------------------------------------------------------- data fetch
   const [isSyncingSession, setIsSyncingSession] = useState(false);
 
-  const fetchToken = async (): Promise<string | null> => {
+  /** Checks whether an active panel session exists and unlocks the UI. */
+  const checkAuth = async (): Promise<boolean> => {
     try {
-      const res = await fetch("/auth/token");
+      const res = await fetch("/api/auth/me", { credentials: "same-origin" });
       if (res.ok) {
         const data = await res.json();
-        if (data && data.token) {
-          setPanelToken(data.token);
-          sessionStorage.setItem("panel_token", data.token);
-          return data.token;
-        }
+        const ok = !!data?.authenticated;
+        setIsAuthenticated(ok);
+        setApiLocked(!ok);
+        return ok;
       }
     } catch (err) {
-      console.error("Failed to fetch panel token:", err);
+      console.error("Failed to check panel session:", err);
     }
-    return null;
+    setIsAuthenticated(false);
+    setApiLocked(true);
+    return false;
+  };
+
+  const login = async (token: string) => {
+    setLoginError(null);
+    setIsLoggingIn(true);
+    try {
+      const res = await fetch("/api/auth/login", {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ token }),
+      });
+      if (res.ok) {
+        setIsAuthenticated(true);
+        setApiLocked(false);
+        return true;
+      }
+      const data = await res.json().catch(() => null);
+      setLoginError(data?.error || "Login failed. Check the access key and try again.");
+    } catch (err) {
+      setLoginError("Network error during login. Please retry.");
+    } finally {
+      setIsLoggingIn(false);
+    }
+    return false;
+  };
+
+  const logout = async () => {
+    try {
+      await fetch("/api/auth/logout", { method: "POST", credentials: "same-origin" });
+    } catch {}
+    setIsAuthenticated(false);
+    setApiLocked(true);
   };
 
   const reSyncSession = async () => {
     setIsSyncingSession(true);
-    const token = await fetchToken();
-    if (token) {
-      setApiLocked(false);
+    const ok = await checkAuth();
+    if (ok) {
       // Re-trigger global diagnostic updates
       fetchConfig();
       fetchCommands();
@@ -416,11 +452,13 @@ export default function App() {
   };
 
   useEffect(() => {
-    fetchToken();
+    checkAuth();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
-    // Only query protected endpoints once we have acquired a token (or if session storage had it)
+    // Only query protected endpoints once a real session exists.
+    if (!isAuthenticated) return;
     fetchConfig();
     fetchCommands();
     fetchStatus();
@@ -434,7 +472,7 @@ export default function App() {
 
     return () => clearInterval(interval);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [panelToken]);
+  }, [isAuthenticated]);
 
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -477,38 +515,21 @@ export default function App() {
     return () => clearInterval(timer);
   }, [pairingExpiresAt, pairingCode]);
 
-  /** Central fetch wrapper: tracks auth failures, attempts silent auto-refresh, and retries. */
+  /** Central fetch wrapper: uses the HttpOnly session cookie; 401 → locked UI. */
   const apiFetch = async (url: string, init?: RequestInit): Promise<Response | null> => {
     try {
-      const headers = new Headers(init?.headers || {});
-      let activeToken = panelToken || sessionStorage.getItem("panel_token");
-      if (activeToken) {
-        headers.set("Authorization", `Bearer ${activeToken}`);
-      }
-      
       let res = await fetch(url, {
         ...init,
-        headers,
+        credentials: "same-origin",
       });
 
-      // If we encounter a 401, attempt to silently refresh the token and retry once
-      if (res.status === 401) {
-        console.warn(`[API Access] Received 401 on ${url}. Attempting silent session refresh...`);
-        const refreshedToken = await fetchToken();
-        if (refreshedToken && refreshedToken !== activeToken) {
-          console.log(`[API Access] Token refreshed successfully. Retrying request to ${url}...`);
-          const retryHeaders = new Headers(init?.headers || {});
-          retryHeaders.set("Authorization", `Bearer ${refreshedToken}`);
-          res = await fetch(url, {
-            ...init,
-            headers: retryHeaders,
-          });
-        }
-      }
-
+      // Session expired or missing: flip the whole UI to the login screen.
       if (res.status === 401) {
         setApiLocked(true);
-      } else if (res.ok) {
+        setIsAuthenticated(false);
+        return res;
+      }
+      if (res.ok) {
         setApiLocked(false);
       }
       return res;
@@ -1472,6 +1493,80 @@ export default function App() {
   const totalSimulated = chatMessages.length - 1;
 
   // ------------------------------------------------------------------ render
+  // Session bootstrap / login gate: the panel never touches the API without a
+  // server-issued session. The access key is entered only here and is never
+  // stored in the browser (sessionStorage/localStorage are not used).
+  if (isAuthenticated === null) {
+    return (
+      <div className="flex h-screen w-full items-center justify-center bg-black text-zinc-100 font-sans">
+        <div className="flex flex-col items-center gap-4">
+          <SpeedLoader color="#f59e0b" text="Verifying panel session..." />
+        </div>
+      </div>
+    );
+  }
+
+  if (!isAuthenticated) {
+    return (
+      <div className="flex h-screen w-full items-center justify-center bg-black text-zinc-100 font-sans p-4">
+        <motion.div
+          initial={{ opacity: 0, y: 10 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ duration: 0.2 }}
+          className="w-full max-w-md rounded-2xl border border-white/10 bg-[#0d1420] p-8 shadow-2xl"
+        >
+          <div className="flex flex-col items-center text-center mb-6">
+            <div className="w-14 h-14 rounded-2xl bg-amber-500/15 border border-amber-500/30 flex items-center justify-center mb-4">
+              <Shield className="w-7 h-7 text-amber-400" />
+            </div>
+            <h1 className="text-lg font-bold text-white">Nebula Controller — Panel Access</h1>
+            <p className="text-xs text-zinc-400 mt-2 leading-relaxed">
+              Enter the panel access key. It is printed in the server console on startup
+              (or set via the <code className="bg-white/10 px-1 rounded font-mono text-amber-300">PANEL_TOKEN</code> environment variable).
+              The key is never stored in your browser.
+            </p>
+          </div>
+
+          <form
+            onSubmit={(e) => {
+              e.preventDefault();
+              const input = (e.currentTarget.elements.namedItem("accessKey") as HTMLInputElement);
+              if (input?.value) login(input.value);
+            }}
+            className="space-y-3"
+          >
+            <div className="relative">
+              <KeyRound className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-zinc-500" />
+              <input
+                name="accessKey"
+                type="password"
+                autoFocus
+                placeholder="Panel access key"
+                className="w-full rounded-xl bg-white/5 border border-white/10 pl-10 pr-3 py-3 text-sm text-white placeholder:text-zinc-600 outline-none focus:border-amber-500/60 focus:ring-2 focus:ring-amber-500/20 transition"
+              />
+            </div>
+            {loginError && (
+              <p className="text-xs text-rose-400 bg-rose-950/40 border border-rose-800/40 rounded-lg px-3 py-2">
+                {loginError}
+              </p>
+            )}
+            <button
+              type="submit"
+              disabled={isLoggingIn}
+              className="w-full rounded-xl bg-amber-500 hover:bg-amber-400 disabled:opacity-60 text-black text-sm font-bold py-3 transition flex items-center justify-center gap-2 cursor-pointer"
+            >
+              {isLoggingIn ? <Loader scale={0.28} className="!gap-0" /> : "Unlock Panel"}
+            </button>
+          </form>
+
+          <p className="text-[10px] text-zinc-600 text-center mt-6">
+            Session cookie is HttpOnly and expires automatically after 12 hours of activity.
+          </p>
+        </motion.div>
+      </div>
+    );
+  }
+
   return (
     <div className="flex h-screen w-full overflow-hidden bg-black text-zinc-100 font-sans" id="app_root">
       {/* Reference Template Sidebar */}
@@ -1515,10 +1610,10 @@ export default function App() {
                 {isSyncingSession ? "Re-syncing..." : "Re-sync Session"}
               </button>
               <button
-                onClick={() => { window.location.reload(); }}
+                onClick={logout}
                 className="px-3 py-1 bg-zinc-800 hover:bg-zinc-700 text-white rounded-md text-xs font-bold transition cursor-pointer"
               >
-                Reload Page
+                Sign Out
               </button>
             </div>
           </div>
@@ -3922,6 +4017,12 @@ export default function App() {
               {/* ============================================================ SECURITY */}
               {activeTab === "security" && (
                 <div className="space-y-6">
+                  {/* RoleGuard */}
+                  <AccessControlPanel />
+
+                  {/* Audit trail + backup/restore + AI budget */}
+                  <SecurityExtras />
+
                   {/* Security Guardrails Header */}
                   <div className="grid grid-cols-1 xl:grid-cols-2 gap-6">
                     {/* Rate Limiting & Policies */}

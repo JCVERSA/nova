@@ -6,6 +6,7 @@ import path from "path";
 import os from "os";
 import { exec, spawn } from "child_process";
 import { registerTempDownload } from "../tempDownloadManager.js";
+import { isSafeDownloadUrl } from "../urlSafety.js";
 import { createBatchJob, updateEpisodeProgress, updateJobStatus, completeBatchJob } from "../batchDownloadManager.js";
 
 interface HlsVariant {
@@ -49,6 +50,11 @@ const sessions = new Map<string, AnimeSession>();
 
 const SESSION_TIMEOUT = 5 * 60 * 1000; // 5 minutes
 
+// Resource ceilings for batch work triggered by untrusted WhatsApp users.
+const MAX_BATCH_EPISODES = Math.max(1, Number(process.env.NEBULA_NOVABOX_MAX_EPISODES || 12));
+const MAX_BATCH_TOTAL_MB = Math.max(1, Number(process.env.NEBULA_NOVABOX_MAX_BATCH_MB || 2048));
+
+
 function clearUserSession(sender: string) {
   const session = sessions.get(sender);
   if (session) {
@@ -62,6 +68,15 @@ function sanitizeFilename(name: string): string {
     .replace(/[^a-zA-Z0-9_\-\[\]]/g, "_")
     .replace(/__+/g, "_")
     .replace(/^_+|_+$/g, "");
+}
+
+/** Rejects non-public fetch destinations before any server-side request. */
+async function isPublicFetchTarget(rawUrl: string, label: string): Promise<boolean> {
+  try {
+    if (await isSafeDownloadUrl(rawUrl)) return true;
+  } catch {}
+  console.warn(`[NOVABOX] Blocked unsafe ${label}: ${rawUrl}`);
+  return false;
 }
 
 // Search Anime-Sama
@@ -95,6 +110,7 @@ async function searchAnime(query: string) {
 
 // Parse main anime page for seasons (panneauAnime calls)
 async function parseSeasons(animeUrl: string) {
+  if (!(await isPublicFetchTarget(animeUrl, "season page"))) return [];
   const res = await axios.get(animeUrl, {
     headers: {
       "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -140,6 +156,7 @@ async function checkVfExists(url: string): Promise<boolean> {
 
 // Parse episodes.js file
 async function parseEpisodes(jsUrl: string) {
+  if (!(await isPublicFetchTarget(jsUrl, "episode list"))) return {};
   const res = await axios.get(jsUrl, {
     headers: {
       "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -804,6 +821,81 @@ function unpack(p: string, a: number, c: number, k: string[]): string {
   return p;
 }
 
+/**
+ * Decodes a JavaScript string literal the way `eval` would for the simple
+ * escaped strings found in Dean Edwards packed scripts — without eval.
+ * Supports the escapes actually emitted by packers (\xNN, \uNNNN,
+ * \n \r \t \\ \' \").
+ */
+export function decodeJsStringLiteral(literal: string): string {
+  const trimmed = literal.trim();
+  const quote = trimmed[0];
+  if ((quote !== '"' && quote !== "'") || trimmed[trimmed.length - 1] !== quote) {
+    return trimmed;
+  }
+  const body = trimmed.slice(1, -1);
+  let out = "";
+  for (let i = 0; i < body.length; i++) {
+    const ch = body[i];
+    if (ch !== "\\") {
+      out += ch;
+      continue;
+    }
+    const next = body[i + 1];
+    if (next === undefined) {
+      out += "\\";
+      break;
+    }
+    switch (next) {
+      case "n": out += "\n"; i++; break;
+      case "r": out += "\r"; i++; break;
+      case "t": out += "\t"; i++; break;
+      case "\\": out += "\\"; i++; break;
+      case "'": out += "'"; i++; break;
+      case '"': out += '"'; i++; break;
+      case "x": {
+        const hex = body.slice(i + 2, i + 4);
+        if (/^[0-9a-fA-F]{2}$/.test(hex)) {
+          out += String.fromCharCode(parseInt(hex, 16));
+          i += 3;
+        } else {
+          out += "x";
+        }
+        break;
+      }
+      case "u": {
+        const hex = body.slice(i + 2, i + 6);
+        if (/^[0-9a-fA-F]{4}$/.test(hex)) {
+          out += String.fromCharCode(parseInt(hex, 16));
+          i += 5;
+        } else {
+          out += "u";
+        }
+        break;
+      }
+      default:
+        out += next;
+        i++;
+    }
+  }
+  return out;
+}
+
+/**
+ * Parses the simple flat array literal used as the `k` parameter of packed
+ * scripts (['a','b',...]) without eval. Numeric elements are kept as-is.
+ */
+export function decodeJsArrayLiteral(literal: string): string[] {
+  const trimmed = literal.trim();
+  if (!trimmed.startsWith("[") || !trimmed.endsWith("]")) return [];
+  const inner = trimmed.slice(1, -1);
+  if (!inner.trim()) return [];
+  return inner.split(",").map((part) => decodeJsStringLiteral(part));
+}
+
+/** Layer counter guard so untrusted inputs cannot cause a pathological loop. */
+const MAX_UNPACK_LAYERS = 4;
+
 // Extract HLS stream URL exclusively from VidMoly (vidmoly.to, vidmoly.net, vidmoly.me, ansembed.net)
 async function extractHlsUrlFromVidMoly(embedUrl: string): Promise<{ hlsUrl: string | null; refererUrl: string; originUrl: string }> {
   if (!embedUrl) {
@@ -820,6 +912,9 @@ async function extractHlsUrlFromVidMoly(embedUrl: string): Promise<{ hlsUrl: str
       if (match) originUrl = match[0];
     }
 
+    if (!(await isPublicFetchTarget(embedUrl, "embed page"))) {
+      return { hlsUrl: null, refererUrl: embedUrl, originUrl };
+    }
     const res = await axios.get(embedUrl, {
       headers: {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -848,11 +943,26 @@ async function extractHlsUrlFromVidMoly(embedUrl: string): Promise<{ hlsUrl: str
     let match: RegExpExecArray | null;
     while ((match = packedRegex.exec(html)) !== null) {
       try {
-        const pVal = eval(match[1]);
+        // Eval-free unpacking: the packed parameters are plain escaped
+        // string/array literals; decoding them keeps third-party fetched
+        // content from ever being executed as code.
+        const pVal = decodeJsStringLiteral(match[1]);
         const aVal = parseInt(match[2], 10);
         const cVal = parseInt(match[3], 10);
-        const kVal = eval(match[4]).split("|");
-        const unpacked = unpack(pVal, aVal, cVal, kVal);
+        const kVal = decodeJsArrayLiteral(match[4]);
+        let unpacked = unpack(pVal, aVal, cVal, kVal);
+
+        // Handle multi-layer packing (unpacked output may contain another
+        // packed script) with a hard layer ceiling.
+        for (let layer = 0; layer < MAX_UNPACK_LAYERS; layer++) {
+          const innerMatch = packedRegex.exec(unpacked);
+          if (!innerMatch || unpacked.includes("eval")) break;
+          const innerP = decodeJsStringLiteral(innerMatch[1]);
+          const innerA = parseInt(innerMatch[2], 10);
+          const innerC = parseInt(innerMatch[3], 10);
+          const innerK = decodeJsArrayLiteral(innerMatch[4]);
+          unpacked = unpack(innerP, innerA, innerC, innerK);
+        }
 
         const unpackedM3u8 = unpacked.match(/sources:\s*\[\s*\{\s*file:\s*["']([^"']+\.(?:m3u8|txt)[^"']*)["']/i) ||
                              unpacked.match(/file:\s*["'](https?:\/\/[^"']+\.(?:m3u8|txt)[^"']*)["']/i) ||
@@ -899,6 +1009,9 @@ async function resolveEpisodeStream(episodes: Record<number, string[]>, epIndex:
 // Inspect and perform HEAD / Range diagnostic request to media source to verify stream reachability & content size
 async function probeMediaHeaders(targetUrl: string, refererUrl: string, originUrl: string): Promise<{ contentLengthBytes: number; isRangeSupported: boolean; httpStatus: number; contentType: string }> {
   try {
+    if (!(await isPublicFetchTarget(targetUrl, "stream probe"))) {
+      return { contentLengthBytes: 0, isRangeSupported: false, httpStatus: 0, contentType: "unknown" };
+    }
     const res = await axios.head(targetUrl, {
       headers: {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -935,6 +1048,7 @@ async function probeMediaHeaders(targetUrl: string, refererUrl: string, originUr
 // Validate whether an individual stream sub-playlist is alive and delivers valid media content
 async function validateVidMolyStreamVariant(streamUrl: string, refererUrl: string, originUrl: string): Promise<boolean> {
   try {
+    if (!(await isPublicFetchTarget(streamUrl, "stream variant"))) return false;
     const res = await axios.get(streamUrl, {
       headers: {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -959,6 +1073,7 @@ async function validateVidMolyStreamVariant(streamUrl: string, refererUrl: strin
 // Inspect and parse master HLS playlist exclusively from VidMoly, dynamically fetching and validating all available resolutions from stream metadata
 async function inspectHlsStreams(hlsUrl: string, refererUrl: string, originUrl: string): Promise<HlsVariant[]> {
   try {
+    if (!(await isPublicFetchTarget(hlsUrl, "HLS playlist"))) return [];
     // 1. Fetch master playlist from VidMoly
     const res = await axios.get(hlsUrl, {
       headers: {
@@ -1077,8 +1192,13 @@ async function executeFfmpegDownload(
   localPath: string,
   timeoutMs: number = 25000
 ): Promise<boolean> {
-  return new Promise<boolean>((resolve) => {
+  return new Promise<boolean>(async (resolve) => {
     try {
+      // SSRF through ffmpeg: never hand an unvalidated URL to a subprocess.
+      if (!(await isPublicFetchTarget(targetHlsUrl, "ffmpeg input"))) {
+        resolve(false);
+        return;
+      }
       const headersStr = `Referer: ${downloadSourceUrl}\r\nOrigin: ${originUrl}\r\n`;
       const args = [
         "-y",
@@ -1152,6 +1272,13 @@ async function sendFinalEpisode(sock: any, msg: any, context: BotCommandContext,
 
   // If multiple episodes or full season requested, run batch processor
   if (indices.length > 1 || session.isSeasonZipDownload) {
+    if (indices.length > MAX_BATCH_EPISODES) {
+      await context.react("⚠️");
+      return context.reply(
+        `⚠️ *Batch Limit:* This request covers *${indices.length} episodes*, which exceeds the safe batch limit of *${MAX_BATCH_EPISODES}*.\n` +
+        `Please split it into smaller requests (e.g. episodes 1–${MAX_BATCH_EPISODES}).`
+      );
+    }
     await context.react("⏳");
     await context.reply(
       `📦 *Nebula Novabox - Batch Media Preparation* 🚀\n\n` +
@@ -1214,6 +1341,14 @@ async function sendFinalEpisode(sock: any, msg: any, context: BotCommandContext,
           const success = await executeFfmpegDownload(targetHlsUrl, downloadSourceUrl, originUrl, localPath, 15000);
 
           if (success && fs.existsSync(localPath) && fs.statSync(localPath).size > 1000) {
+            const totalMBSoFar = generatedLinks.reduce((sum, g) => sum + g.sizeMB, 0);
+            const thisMB = fs.statSync(localPath).size / (1024 * 1024);
+            if (totalMBSoFar + thisMB > MAX_BATCH_TOTAL_MB) {
+              try { fs.unlinkSync(localPath); } catch {}
+              cdnRestricted = true;
+              updateEpisodeProgress(batchJob.id, epNum, { status: "failed", progressPercent: 0, error: "Batch byte quota exceeded" });
+              break;
+            }
             downloadedFilePaths.push(localPath);
             const tempDownload = registerTempDownload(localPath, filename, {
               ttlMinutes: 120, // 2 hours for individual episodes

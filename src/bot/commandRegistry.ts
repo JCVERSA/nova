@@ -32,6 +32,7 @@ import helpCommand from "./commands/help.js";
 import swebCommand from "./commands/sweb.js";
 import videoCommand from "./commands/video.js";
 import animeCommand from "./commands/novabox.js";
+import accessCommand from "./commands/access.js";
 import { getCompiledPath } from "./commandCompiler.js";
 import { loadImportedCommands } from "./importedBridge.js";
 
@@ -109,6 +110,7 @@ const defaultCommands = [
   swebCommand,
   videoCommand,
   animeCommand,
+  accessCommand,
 ];
 
 function register(cmd: BotCommand) {
@@ -213,12 +215,27 @@ export async function initRegistry(): Promise<void> {
     const name = file.replace(/\.ts$/, "").toLowerCase();
     if (builtinNames.has(name)) continue; // built-ins win to avoid duplicates
     const cmd = await loadCommandModule(name);
-    if (cmd && cmd.name) {
+    // L3: a disk file whose exported name is already registered (e.g.
+    // novabox.ts exporting "anime", a static built-in) is a duplicate —
+    // skip it instead of loading it twice.
+    if (cmd && cmd.name && !commandsMap.has(cmd.name.toLowerCase())) {
       register(cmd);
       console.log(`🔮 [Registry] Loaded command from disk: ${cmd.name}`);
+    } else if (cmd && cmd.name) {
+      console.log(`[Registry] Skipped duplicate disk command: ${cmd.name}`);
     } else {
       console.warn(`[Registry] Skipped unloadable command file: ${file}`);
     }
+  }
+
+  // Panel-authored commands (C4): data-driven, sandboxed, registered through
+  // the safe runner — never loaded from disk as executable modules. Dynamic
+  // import avoids a module cycle (panelCommands registers into this registry).
+  try {
+    const { registerPanelCommands } = await import("./panelCommands.js");
+    registerPanelCommands();
+  } catch (err: any) {
+    console.warn("[Registry] Failed to register panel commands:", err?.message || err);
   }
 
   updateGlobalCommands();

@@ -39,6 +39,11 @@ const defaultGroupSettings: GroupSettings = {
 const groupsCache = new Map<string, GroupSettings>();
 const warningsCache = new Map<string, UserWarning>();
 
+// M7: hard caps so untrusted traffic cannot grow these maps without bound.
+const GROUPS_CACHE_MAX = 5000;
+const WARNINGS_CACHE_MAX = 2000;
+const WARNING_REASONS_MAX = 8;
+
 // Init directories
 if (!fs.existsSync(DB_DIR)) {
   fs.mkdirSync(DB_DIR, { recursive: true });
@@ -126,6 +131,10 @@ export const database = {
   getGroupSettings(groupId: string): GroupSettings {
     if (!groupsCache.has(groupId)) {
       groupsCache.set(groupId, { ...defaultGroupSettings });
+      if (groupsCache.size > GROUPS_CACHE_MAX) {
+        const oldest = groupsCache.keys().next().value as string | undefined;
+        if (oldest) groupsCache.delete(oldest);
+      }
       saveGroups();
     }
     return groupsCache.get(groupId)!;
@@ -150,11 +159,15 @@ export const database = {
   addWarning(groupId: string, userId: string, reason: string): UserWarning {
     const key = `${groupId}_${userId}`;
     const current = this.getWarnings(groupId, userId);
-    const updated = {
-      count: current.count + 1,
-      reasons: [...current.reasons, reason],
-    };
+    // Keep only the most recent reasons (bounded); count still accumulates.
+    const reasons = [...current.reasons, reason].slice(-WARNING_REASONS_MAX);
+    const updated = { count: current.count + 1, reasons };
+    warningsCache.delete(key);
     warningsCache.set(key, updated);
+    if (warningsCache.size > WARNINGS_CACHE_MAX) {
+      const oldest = warningsCache.keys().next().value as string | undefined;
+      if (oldest) warningsCache.delete(oldest);
+    }
     saveWarnings();
     return updated;
   },
@@ -163,5 +176,28 @@ export const database = {
     const key = `${groupId}_${userId}`;
     warningsCache.delete(key);
     saveWarnings();
+  },
+
+  /** Backup/restore support (validated upstream): replace all group settings. */
+  replaceAllGroups(entries: Record<string, Partial<GroupSettings>>): number {
+    groupsCache.clear();
+    for (const [key, val] of Object.entries(entries || {})) {
+      groupsCache.set(key, { ...defaultGroupSettings, ...(val as any) });
+    }
+    saveGroups();
+    return groupsCache.size;
+  },
+
+  /** Backup/restore support: replace all warnings (bounded). */
+  replaceAllWarnings(entries: Record<string, UserWarning>): number {
+    warningsCache.clear();
+    for (const [key, val] of Object.entries(entries || {})) {
+      warningsCache.set(key, {
+        count: Math.min(Math.max(0, Number(val?.count) || 0), 10_000),
+        reasons: Array.isArray(val?.reasons) ? val.reasons.map(String).slice(-WARNING_REASONS_MAX) : [],
+      });
+    }
+    saveWarnings();
+    return warningsCache.size;
   },
 };

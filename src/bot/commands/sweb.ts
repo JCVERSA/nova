@@ -32,6 +32,8 @@ const swebCommand: BotCommand = {
 
       // Use microlink screenshot API
       const screenshotUrl = `https://api.microlink.io/?url=${encodeURIComponent(url)}&screenshot=true&embed=screenshot.url`;
+      // M11: explicit third-party disclosure
+      await context.reply("ℹ️ Screenshot request sent to a third-party rendering service (microlink.io — the page URL you provided is forwarded to them).");
 
       await context.reply(`📸 *Screenshot of ${url}:*`, screenshotUrl);
     } catch (error: any) {
