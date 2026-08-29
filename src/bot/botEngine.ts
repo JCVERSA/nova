@@ -14,10 +14,15 @@ import { incrementCommandStats } from "./commandStats.js";
 import { generateTextWithFallback } from "./geminiClient.js";
 import { database } from "./database.js";
 import { inspectMessageSafety } from "./utils/antibot.js";
+import { checkAIQuota, consumeAIQuota, withAIConcurrency } from "./aiQuota.js";
+import { authorizeCommand, resolveRole } from "./accessControl.js";
+import { getGroupPolicy } from "./groupAccessStore.js";
+import { recordAudit } from "./auditTrail.js";
 
 
 const groupMetadataCache = new Map<string, { data: any; timestamp: number }>();
 const CACHE_TTL = 30000; // 30 seconds cache
+const CACHE_MAX_ENTRIES = 500; // M7: bound memory for departed/unused groups
 
 export function invalidateGroupMetadataCache(groupId?: string) {
   if (groupId) {
@@ -35,6 +40,10 @@ async function getCachedGroupMetadata(sock: any, groupId: string) {
   try {
     const metadata = await sock.groupMetadata(groupId);
     groupMetadataCache.set(groupId, { data: metadata, timestamp: Date.now() });
+    if (groupMetadataCache.size > CACHE_MAX_ENTRIES) {
+      const oldest = groupMetadataCache.keys().next().value as string | undefined;
+      if (oldest) groupMetadataCache.delete(oldest);
+    }
     return metadata;
   } catch (err) {
     return cached ? cached.data : null;
@@ -70,6 +79,23 @@ const botState: BotState = {
   reconnectCount: 0,
   reconnectTimeout: null,
 };
+
+/** M6: mask a WhatsApp number in logs (keep only the last 4 digits). */
+export function maskLogNumber(value: string): string {
+  const digits = String(value || "").replace(/[^0-9]/g, "");
+  if (digits.length <= 4) return "…" + digits;
+  return "…" + digits.slice(-4);
+}
+
+/** M6: when logging is set to content-off (default), never echo message text. */
+const LOG_MESSAGE_CONTENT = process.env.NEBULA_LOG_CONTENT === "1";
+
+export function maskLogText(text: string): string {
+  if (LOG_MESSAGE_CONTENT) {
+    return text.substring(0, 60) + (text.length > 60 ? "..." : "");
+  }
+  return "[content hidden]";
+}
 
 export function addLog(message: string) {
   const timestamp = new Date().toLocaleTimeString();
@@ -181,7 +207,7 @@ function createMockSocket(capture: {
 
 // Simulated execution for the web play-zone
 export async function simulateMessage(senderName: string, text: string): Promise<{ text: string; imageUrl?: string; emoji?: string }> {
-  addLog(`[Simulator] Message from ${senderName}: "${text}"`);
+  addLog(`[Simulator] Message from ${senderName}: "${maskLogText(text)}"`);
 
   const config = getConfig();
   const prefix = config.prefix;
@@ -203,7 +229,7 @@ export async function simulateMessage(senderName: string, text: string): Promise
           `You are ${config.botName}, an intelligent WhatsApp multi-device bot assistant in direct private chat. Provide helpful, conversational, natural, and crisp responses.`,
           "gemini-3.7-flash"
         );
-        addLog(`[Simulator Direct AI] Generated direct reply for "${text.slice(0, 40)}"`);
+        addLog(`[Simulator Direct AI] Generated direct reply for "${maskLogText(text)}"`);
         return { text: aiAnswer, emoji: "🤖" };
       } catch (err: any) {
         addLog(`[Simulator Direct AI Error] ${err.message}`);
@@ -319,7 +345,20 @@ export async function simulateMessage(senderName: string, text: string): Promise
 }
 
 // Live Baileys startup
-export async function startLiveBot(isManualStart = false, pairingPhone?: string) {
+// Serialized: concurrent start calls (manual button + API + reconnect timer)
+// previously raced and could create two live sockets. A single in-flight
+// promise now guarantees one socket per (re)start cycle.
+let startInFlight: Promise<void> | null = null;
+
+export function startLiveBot(isManualStart = false, pairingPhone?: string): Promise<void> {
+  if (startInFlight) return startInFlight;
+  startInFlight = runStartLiveBot(isManualStart, pairingPhone).finally(() => {
+    startInFlight = null;
+  });
+  return startInFlight;
+}
+
+async function runStartLiveBot(isManualStart = false, pairingPhone?: string) {
   if (botState.status === "connected") {
     addLog("⚠️ Bot is already connected.");
     return;
@@ -687,7 +726,7 @@ export async function startLiveBot(isManualStart = false, pairingPhone?: string)
 
         // Add visual live logs to the dashboard so the user knows messages are being processed
         if (text.trim()) {
-          addLog(`📨 Message Received: "${text.substring(0, 60)}${text.length > 60 ? "..." : ""}" from ${senderName} (${senderNumber}) [fromMe: ${isFromMe}]`);
+          addLog(`📨 Message Received: "${maskLogText(text)}" from ${senderName} (${maskLogNumber(senderNumber)}) [fromMe: ${isFromMe}]`);
         }
 
         // Active Group Moderation Engine
@@ -714,7 +753,7 @@ export async function startLiveBot(isManualStart = false, pairingPhone?: string)
           if ((settings.antilink || settings.antibot) && !isSenderAdmin && !isOwner) {
             const safety = inspectMessageSafety(senderJid, text, msg, actualSenderJid);
             if (safety.isViolation) {
-              addLog(`🛡️ [Security Violation] ${safety.description} from @${actualSenderNumber} in group ${senderJid}`);
+              addLog(`🛡️ [Security Violation] ${safety.description} from @${maskLogNumber(actualSenderNumber)} in group ${maskLogNumber(senderJid)}`);
 
               if (isBotAdmin) {
                 await sock.sendMessage(senderJid, { delete: msg.key });
@@ -778,16 +817,24 @@ export async function startLiveBot(isManualStart = false, pairingPhone?: string)
         if (!isGroup && !isFromMe && !text.startsWith(prefix)) {
           const apiKey = process.env.GEMINI_API_KEY;
           if (apiKey && apiKey !== "MY_GEMINI_API_KEY" && apiKey.trim() !== "") {
+            const quota = checkAIQuota(actualSenderJid);
+            if (!quota.allowed) {
+              await sock.sendMessage(senderJid, { text: `⚠️ ${quota.error}` }, { quoted: msg });
+              continue;
+            }
             try {
               if (sock && typeof sock.sendPresenceUpdate === "function") {
                 try {
                   await sock.sendPresenceUpdate("composing", senderJid);
                 } catch (pe) {}
               }
-              const answer = await generateTextWithFallback(
-                text,
-                `You are ${config.botName}, an intelligent WhatsApp multi-device bot assistant. You are chatting directly in a 1-on-1 private conversation. Keep responses helpful, direct, concise, natural, and clean.`,
-                "gemini-3.7-flash"
+              consumeAIQuota(actualSenderJid);
+              const answer = await withAIConcurrency(() =>
+                generateTextWithFallback(
+                  text,
+                  `You are ${config.botName}, an intelligent WhatsApp multi-device bot assistant. You are chatting directly in a 1-on-1 private conversation. Keep responses helpful, direct, concise, natural, and clean.`,
+                  "gemini-3.7-flash"
+                )
               );
               if (sock && typeof sock.sendPresenceUpdate === "function") {
                 try {
@@ -892,8 +939,13 @@ export async function startLiveBot(isManualStart = false, pairingPhone?: string)
             );
 
             let buffer = Buffer.alloc(0);
+            const MAX_MEDIA_BYTES = 100 * 1024 * 1024; // WhatsApp media ceiling
             for await (const chunk of stream) {
               buffer = Buffer.concat([buffer, chunk]);
+              if (buffer.length > MAX_MEDIA_BYTES) {
+                addLog("Media download aborted: exceeds the 100 MB memory cap.");
+                return null;
+              }
             }
 
             // Log memory safe usage
@@ -957,7 +1009,34 @@ export async function startLiveBot(isManualStart = false, pairingPhone?: string)
           },
         };
 
-        addLog(`💬 Executing dynamic command: [${commandName}] for ${senderName} (${senderNumber})`);
+        addLog(`💬 Executing dynamic command: [${commandName}] for ${senderName} (${maskLogNumber(senderNumber)})`);
+
+        // RoleGuard (M1): declarative ACL gate — fail closed on any error so a
+        // policy/registry problem can never escalate to "everyone allowed".
+        try {
+          const accessPolicy = getGroupPolicy(senderJid);
+          const aclDecision = authorizeCommand(
+            { name: commandName, category: command.category || "misc" },
+            resolveRole({ isOwner, isAdmin: isSenderAdmin, isGroup }),
+            accessPolicy,
+            {
+              ownerOnly: (command as any).ownerOnly,
+              adminOnly: (command as any).adminOnly,
+              groupOnly: (command as any).groupOnly,
+              privateOnly: (command as any).privateOnly,
+            }
+          );
+          if (!aclDecision.allowed) {
+            addLog(`⛔ RoleGuard denied [${commandName}] for ${senderName} (${maskLogNumber(senderNumber)}): ${aclDecision.reason}`);
+            recordAudit(`wa:${maskLogNumber(senderNumber)}`, "roleguard.deny", commandName, aclDecision.reason);
+            await replyHandler(`⛔ *Access Denied:* ${aclDecision.reason}.`);
+            return;
+          }
+        } catch (aclErr: any) {
+          addLog(`⛔ RoleGuard error on [${commandName}] for ${senderName}: ${aclErr.message || aclErr} (fail-closed)`);
+          await replyHandler(`⛔ *Access Denied:* unable to verify permission for this command.`);
+          return;
+        }
 
         try {
           incrementCommandStats(commandName);

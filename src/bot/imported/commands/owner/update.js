@@ -12,6 +12,41 @@ const config = require('../../config');
 
 const MAX_REDIRECTS = 5;
 
+// ---------------------------------------------------------------------------
+// Supply-chain hardening (H2/C2): the owner-only self-update path can rewrite
+// the entire codebase, so it must ALSO be SSRF-safe. Downloads are restricted
+// to public code-hosting hosts, private/literal IPs and local hosts are
+// rejected, and every redirect hop is re-validated. A kill switch disables the
+// feature entirely unless NEBULA_ALLOW_SELF_UPDATE=1.
+// ---------------------------------------------------------------------------
+const SELF_UPDATE_ENABLED = process.env.NEBULA_ALLOW_SELF_UPDATE === '1';
+
+const CODE_HOST_SUFFIXES = [
+  'github.com', 'raw.githubusercontent.com', 'codeload.github.com',
+  'objects.githubusercontent.com', 'githubusercontent.com', 'gitlab.com',
+  'bitbucket.org', 'codeberg.org'
+];
+
+function isUpdaterHost(hostname) {
+  const h = String(hostname || '').toLowerCase().replace(/\.$/, '');
+  if (!h) return false;
+  if (h === 'localhost' || h === '127.0.0.1' || h === '::1' || h.endsWith('.local')) return false;
+  if (/^(\d{1,3}\.){3}\d{1,3}$/.test(h)) return false; // literal IPv4
+  if (h.includes(':')) return false;                     // literal IPv6
+  return CODE_HOST_SUFFIXES.some((suffix) => h === suffix || h.endsWith('.' + suffix));
+}
+
+function assertUpdaterUrl(rawUrl) {
+  if (!SELF_UPDATE_ENABLED) {
+    throw new Error('Self-update is disabled. Set NEBULA_ALLOW_SELF_UPDATE=1 on the server to enable it.');
+  }
+  let url;
+  try { url = new URL(rawUrl); } catch { throw new Error('Invalid update URL.'); }
+  if (url.protocol !== 'https:' && url.protocol !== 'http:') throw new Error('Update URL must be http(s).');
+  if (!isUpdaterHost(url.hostname)) throw new Error('Update URL host is not on the allowed code-hosting allowlist.');
+  return url.toString();
+}
+
 function run(cmd) {
   return new Promise((resolve, reject) => {
     exec(cmd, { windowsHide: true }, (err, stdout, stderr) => {
@@ -53,6 +88,7 @@ function downloadFile(url, dest, visited = new Set()) {
         return reject(new Error('Too many redirects'));
       }
       visited.add(url);
+      assertUpdaterUrl(url);
 
       const client = url.startsWith('https://') ? https : http;
       const req = client.get(url, {
@@ -65,6 +101,7 @@ function downloadFile(url, dest, visited = new Set()) {
           const location = res.headers.location;
           if (!location) return reject(new Error(`HTTP ${res.statusCode} without Location`));
           const nextUrl = new URL(location, url).toString();
+          assertUpdaterUrl(nextUrl); // re-validate every redirect hop
           res.resume();
           return downloadFile(nextUrl, dest, visited).then(resolve).catch(reject);
         }
@@ -155,7 +192,12 @@ module.exports = {
       return extra.reply('❌ No update URL configured. Set updateZipUrl in config.js or pass a URL: `.update <zip_url>`');
     }
 
+    if (!SELF_UPDATE_ENABLED) {
+      return extra.reply('🛡️ Self-update is disabled on this server. Set `NEBULA_ALLOW_SELF_UPDATE=1` to enable it.');
+    }
+
     try {
+      assertUpdaterUrl(zipUrl); // fail on private/local/LAN/odd hosts before touching disk
       await extra.reply('🔄 Updating the bot, please wait…');
 
       const { copiedFiles } = await updateViaZip(zipUrl);

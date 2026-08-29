@@ -21,6 +21,7 @@ beforeAll(async () => {
 
 export default diskCmd;
 `;
+  fs.mkdirSync(commandsDir, { recursive: true });
   fs.writeFileSync(path.join(commandsDir, "diskcmd.ts"), code, "utf-8");
 });
 

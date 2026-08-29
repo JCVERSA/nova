@@ -5,8 +5,8 @@ Lightweight, modular **WhatsApp multi-device bot** with AI capabilities (Gemini)
 ## ✨ Features
 
 - **WhatsApp Multi-Device** via Baileys — QR pairing from the panel, automatic reconnect with bad-session recovery
-- **21+ built-in commands** — AI chat, image generation, media download, weather, dictionary, games (trivia, RPS, truth/dare), roasts, quotes, jokes, and more
-- **Dynamic command registry** — commands are loaded from `src/bot/commands/*.ts` at startup; new commands can be saved or AI-generated from the panel and hot-loaded without restarting
+- **126 built-in commands and 115 imported commands** — AI chat, image generation, media download, weather, dictionary, games (trivia, RPS, truth/dare), roasts, quotes, jokes, and more
+- **Dynamic command registry** — commands are loaded from `src/bot/commands/*.ts` at startup; new commands can be saved or AI-generated from the panel and run **sandboxed** (no filesystem/process/network) without restarting
 - **Group moderation** — antilink (delete/kick), antitag (mass-mention protection), welcome/goodbye messages, hidetag broadcasts (admin-gated)
 - **Gemini AI playground** — audio transcription and voice conversation with TTS
 - **Secrets manager** — set your `GEMINI_API_KEY` right from the panel (saved to the server's `.env`, applied immediately, masked display only)
@@ -27,10 +27,14 @@ Requirements: **Node.js 18+** (npm is the canonical package manager).
 | Variable | Required | Description |
 |---|---|---|
 | `GEMINI_API_KEY` | for AI features | Google Gemini API key (AI Studio injects it via Secrets) |
-| `PANEL_TOKEN` | optional | Protects all `/api/*` endpoints. If unset, a random token is generated at startup and handed to the panel as an HttpOnly cookie (printed once to the console) |
-| `APP_URL` | optional | Public URL of this applet |
+| `PANEL_TOKEN` | recommended | Panel access key. The panel UI asks for it once and exchanges it for a server-side HttpOnly session cookie (12h sliding); the key is never stored in the browser. Also accepted as a bearer token for scripts. If unset, a random key is generated and printed once to the console |
+| `APP_URL` | optional | Public URL of the panel. When set, requests with a foreign `Host` header are rejected (host-header/rebinding guard) |
+| `NEBULA_PANEL_COMMANDS` | optional | `on` (default) enables sandboxed panel-created commands; `off` disables the feature |
+| `NEBULA_AI_DAILY_LIMIT` | optional | Per-sender daily AI request budget (default 40) |
+| `NEBULA_AI_MAX_CONCURRENT` | optional | Global cap on concurrent AI requests (default 3) |
+| `NEBULA_TEMP_MAX_BYTES` | optional | Storage ceiling for temp downloads (default 4 GiB) |
 | `PORT` | optional | HTTP port (default 3000) |
-| `NEBULA_DATA_DIR` | optional | Runtime state directory (config, group settings, stats). Default `./database` |
+| `NEBULA_DATA_DIR` | optional | Runtime state directory (config, access policies, panel commands, stats). Default `./database` |
 | `NEBULA_ENV_FILE` | optional | Path of the env file the Secrets UI writes to. Default `./.env` |
 
 Copy `.env.example` to `.env` and fill in your values.
@@ -75,16 +79,18 @@ server.ts (entry) ── createApp() (app.ts: auth, rate limiting, /api routes)
 
 ## 🔒 Security Notes
 
-- Every `/api/*` endpoint requires the panel token (cookie for the panel UI, `Authorization: Bearer <token>` for tools).
-- Rate limiting protects the Gemini and command-generation endpoints.
+- **Panel auth (C1/H5):** every `/api/*` endpoint requires a login. The access key is exchanged for a server-side HttpOnly session cookie; state-changing requests made with the cookie also require a matching `Origin`/`Referer` (CSRF). Bearer tokens work for tooling without CSRF checks.
+- **Import command ACL (C2):** the import bridge enforces `ownerOnly` / `adminOnly` / `groupOnly` / `privateOnly` / `botAdminNeeded` metadata centrally, with a hard owner-only deny-list for dangerous commands (`update`, `restart`, `broadcast`, …).
+- **Sandboxed panel commands (C4):** commands created in the panel are stored as data and executed in a `vm` sandbox with no `fs`/`process`/network/`child_process` access; dangerous imports are rejected at save time. Set `NEBULA_PANEL_COMMANDS=off` to disable.
+- **SSRF (H2):** every user-supplied URL (downloads, video, novabox/ffmpeg) is validated per redirect hop with DNS pinning to the resolved IP, plus host allowlists for YouTube/VidMoly.
+- **Resource caps (H3):** streamed downloads with byte caps + timeouts, temp-storage quotas, batch episode/size limits, media buffer cap, AI daily budget + concurrency cap.
 - The ZIP export **never embeds your live API key** — it ships a placeholder `.env`.
-- User-supplied download URLs are validated against private/loopback/link-local networks (SSRF guard) before any fetch.
 - Simulator output is HTML-escaped before rendering (no XSS from AI/user content).
-- Admin commands (`antilink`, `antitag`, `hidetag`) are restricted to group admins/owner.
+- Admin commands are restricted to group admins/owner; group policies can be managed per group with `/access` (RoleGuard).
 
 ## 🧩 Adding Commands
 
-Create a file in `src/bot/commands/` exporting a `BotCommand` (see `ping.ts` for the minimal shape) — it is picked up automatically on startup. You can also create commands from the panel (**Command Customizer → AI Smart Command Creator**), which saves and hot-loads them.
+Create a file in `src/bot/commands/` exporting a `BotCommand` (see `ping.ts` for the minimal shape) — it is picked up automatically on startup. You can also create commands from the panel (**Command Customizer → AI Smart Command Creator**); those are sandboxed and stored as data, never written into the source tree. The panel **Security → RoleGuard** panel and the `/access` command let you set per-group allow/deny policies (owner-only).
 
 ## 📦 Local ZIP Export
 

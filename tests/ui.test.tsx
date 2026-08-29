@@ -24,6 +24,15 @@ const NORMAL_RESPONSES: Record<string, unknown> = {
   ],
   "/api/bot/analytics": { stats: { menu: 5, ping: 3 } },
   "/api/bot/secrets": { secrets: [{ name: "GEMINI_API_KEY", configured: false, masked: null }] },
+  "/api/auth/me": { authenticated: true },
+  "/api/bot/access": {
+    policies: {},
+    defaults: { defaultTo: "allow", adminAllow: [], memberDeny: [], memberAllow: [] },
+    commandIndex: [
+      { name: "ping", category: "General" },
+      { name: "menu", category: "General" },
+    ],
+  },
 };
 
 function mockFetch(handler: (url: string, init?: any) => Promise<{ ok: boolean; status: number; json: () => Promise<any> }>) {
@@ -89,7 +98,7 @@ describe("Nebula dashboard UI", () => {
     expect(screen.getAllByText("API Secrets").length).toBeGreaterThan(0);
   });
 
-  it("handles error responses from the API without crashing the UI", async () => {
+  it("shows the login gate when every API call is rejected", async () => {
     // Simulate an auth failure: every API call returns 401
     vi.stubGlobal(
       "fetch",
@@ -101,9 +110,10 @@ describe("Nebula dashboard UI", () => {
     );
 
     render(<App />);
-    // The shell must still render, and the API-locked banner must appear
-    const titles = await screen.findAllByText("Overview", {}, { timeout: 3000 });
-    expect(titles.length).toBeGreaterThan(0);
-    await waitFor(() => expect(screen.getByText(/Panel API access is locked/)).toBeTruthy());
+    // The login gate must render and the panel must NOT leak the dashboard.
+    const gate = await screen.findByText("Nebula Controller — Panel Access", {}, { timeout: 3000 });
+    expect(gate).toBeTruthy();
+    expect(screen.queryByText("Overview")).toBeNull();
+    expect(screen.getByText(/The key is never stored in your browser/)).toBeTruthy();
   });
 });

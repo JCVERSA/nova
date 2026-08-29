@@ -2,11 +2,30 @@ import fs from "fs";
 import path from "path";
 import { createRequire } from "module";
 import { BotCommand } from "./types.js";
+import { decideBridgeAcl } from "./bridgeAcl.js";
 
-const require = createRequire(import.meta.url);
+// Works in both ESM (tsx/dev) and the CJS production bundle: the bundled
+// server is CJS where `import.meta.url` is empty, so fall back to __filename.
+const require = createRequire(
+  typeof __filename !== "undefined" ? __filename : import.meta.url
+);
+
+export interface BridgeLoadSummary {
+  loaded: number;
+  skipped: number;
+  skippedFiles: string[];
+}
+
+let bridgeSummary: BridgeLoadSummary = { loaded: 0, skipped: 0, skippedFiles: [] };
+
+/** M12: surface vendor breakage loudly instead of silently vanishing commands. */
+export function getBridgeLoadSummary(): BridgeLoadSummary {
+  return { ...bridgeSummary, skippedFiles: [...bridgeSummary.skippedFiles] };
+}
 
 export function loadImportedCommands(): BotCommand[] {
   const commandsList: BotCommand[] = [];
+  const skippedFiles: string[] = [];
   const baseDir = path.join(process.cwd(), "src/bot/imported/commands");
   
   if (!fs.existsSync(baseDir)) {
@@ -14,7 +33,10 @@ export function loadImportedCommands(): BotCommand[] {
     return [];
   }
 
-  const subdirs = ["admin", "anime", "fun", "general", "media", "textmaker", "user", "utility"];
+  // "owner" included and ACL-gated: every owner/* command declares
+  // ownerOnly and the bridge (bridgeAcl) enforces it centrally, so any
+  // contact running them gets a hard Access Denied.
+  const subdirs = ["admin", "anime", "fun", "general", "media", "owner", "textmaker", "user", "utility"];
   
   for (const subdir of subdirs) {
     const dirPath = path.join(baseDir, subdir);
@@ -83,6 +105,29 @@ export function loadImportedCommands(): BotCommand[] {
                 }
               };
 
+              // Centralized access control: the vendored corpus declares its
+              // privileges via metadata but never checks them — the bridge is
+              // the single enforcement point (fail-closed, see bridgeAcl.ts).
+              const acl = decideBridgeAcl(
+                {
+                  name: rawCmd.name,
+                  ownerOnly: rawCmd.ownerOnly,
+                  adminOnly: rawCmd.adminOnly,
+                  groupOnly: rawCmd.groupOnly,
+                  privateOnly: rawCmd.privateOnly,
+                  botAdminNeeded: rawCmd.botAdminNeeded,
+                },
+                {
+                  isOwner: context.isOwner,
+                  isAdmin: context.isAdmin,
+                  isGroup,
+                  isBotAdmin,
+                }
+              );
+              if (!acl.allowed) {
+                return extra.reply(`❌ *Access Denied:* ${acl.reason}`);
+              }
+
               // Execute original CJS handler with standard argument passing
               await rawCmd.execute(sock, msg, context.args, extra);
             }
@@ -93,10 +138,18 @@ export function loadImportedCommands(): BotCommand[] {
         // Some commands might have unresolved compilation requirements at initialization,
         // we log them cleanly to prevent crashing the whole app.
         console.warn(`[Bridge] Gracefully skipped loading command '${file}' from '${subdir}':`, err.message);
+        skippedFiles.push(`${subdir}/${file}`);
       }
     }
   }
 
+  bridgeSummary = { loaded: commandsList.length, skipped: skippedFiles.length, skippedFiles };
   console.log(`[Bridge] Successfully adapted ${commandsList.length} imported commands.`);
+  if (skippedFiles.length > 0) {
+    console.warn(
+      `[Bridge] ⚠️ ${skippedFiles.length} vendored commands could not be loaded (missing native deps, e.g. whatsapp-rust-bridge). ` +
+      `Install the deps or remove those files; the menu deliberately omits them: ${skippedFiles.slice(0, 8).join(", ")}${skippedFiles.length > 8 ? "…" : ""}`
+    );
+  }
   return commandsList;
 }

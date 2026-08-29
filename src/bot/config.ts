@@ -8,7 +8,6 @@ export interface BotConfig {
   ownerNumber: string;
   newsletterUrl: string;
   newsletterName: string;
-  sessionString: string;
   browserPlatform?: string;
   browserName?: string;
   browserVersion?: string;
@@ -22,7 +21,6 @@ export const defaultConfig: BotConfig = {
   ownerNumber: "",
   newsletterUrl: "https://whatsapp.com/channel/0029VaNebulaChannel",
   newsletterName: "Nebula Bot Official News",
-  sessionString: "",
   browserPlatform: "Ubuntu",
   browserName: "Chrome",
   browserVersion: "22.04.4",
@@ -41,7 +39,10 @@ function loadConfig(): BotConfig {
   try {
     if (fs.existsSync(getConfigFile())) {
       const parsed = JSON.parse(fs.readFileSync(getConfigFile(), "utf-8"));
-      return { ...defaultConfig, ...parsed };
+      const merged = { ...defaultConfig, ...parsed } as any;
+      // M2: legacy secret/session fields must never survive into runtime config.
+      delete merged.sessionString;
+      return merged;
     }
   } catch (e: any) {
     console.error("[Config] Failed to load config file, using defaults:", e?.message || e);
@@ -59,7 +60,10 @@ export function updateConfig(newConfig: Partial<BotConfig>): BotConfig {
   currentConfig = { ...currentConfig, ...newConfig };
   try {
     fs.mkdirSync(getDataDir(), { recursive: true });
-    fs.writeFileSync(getConfigFile(), JSON.stringify(currentConfig, null, 2), "utf-8");
+    // Atomic write (temp + rename) so a crash mid-write cannot corrupt config.
+    const tmp = `${getConfigFile()}.${Date.now()}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(currentConfig, null, 2), "utf-8");
+    fs.renameSync(tmp, getConfigFile());
   } catch (e: any) {
     console.error("[Config] Failed to persist config:", e?.message || e);
   }

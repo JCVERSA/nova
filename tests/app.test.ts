@@ -47,13 +47,71 @@ describe("Panel authentication", () => {
     expect(res.body.status).toBeDefined();
   });
 
-  it("hands the panel an HttpOnly cookie on page loads", async () => {
-    const res = await request(app).get("/");
+});
+
+describe("Panel session authentication", () => {
+  it("never exposes the access key via an unauthenticated endpoint", async () => {
+    // The old /auth/token hole must stay closed.
+    const res = await request(app).get("/auth/token");
+    expect(res.status).toBe(404);
+    const res2 = await request(app).get("/api/auth/me");
+    expect(res2.status).toBe(200);
+    expect(res2.body).toEqual({ authenticated: false });
+  });
+
+  it("logs in with the access key and issues an HttpOnly session cookie", async () => {
+    const res = await request(app)
+      .post("/api/auth/login")
+      .send({ token: "test-panel-token" });
+    expect(res.status).toBe(200);
+    expect(res.body.success).toBe(true);
+
     const raw = res.headers["set-cookie"];
     const cookies = Array.isArray(raw) ? raw : [raw];
-    const cookie = cookies.find((c) => typeof c === "string" && c.startsWith("panel_token="));
+    const cookie = cookies.find((c) => typeof c === "string" && c.startsWith("panel_session="));
     expect(cookie).toBeDefined();
     expect(cookie).toContain("HttpOnly");
+    expect(cookie).toContain("SameSite=None");
+
+    // The session cookie must be enough to reach a protected endpoint.
+    const sessionCookie = cookie!.split(";")[0];
+    const me = await request(app).get("/api/auth/me").set("Cookie", sessionCookie);
+    expect(me.status).toBe(200);
+    expect(me.body).toEqual({ authenticated: true });
+
+    const status = await request(app).get("/api/bot/status").set("Cookie", sessionCookie);
+    expect(status.status).toBe(200);
+  });
+
+  it("rejects invalid access keys without issuing a session", async () => {
+    const res = await request(app)
+      .post("/api/auth/login")
+      .send({ token: "wrong-key" });
+    expect(res.status).toBe(401);
+  });
+
+  it("rejects cross-site writes that use a session cookie (CSRF)", async () => {
+    const login = await request(app).post("/api/auth/login").send({ token: "test-panel-token" });
+    const cookie = (Array.isArray(login.headers["set-cookie"]) ? login.headers["set-cookie"][0] : login.headers["set-cookie"]).split(";")[0];
+
+    // Same-origin write is allowed.
+    const sameOrigin = await request(app)
+      .post("/api/bot/clear-logs")
+      .set("Cookie", cookie)
+      .set("Origin", "http://127.0.0.1");
+    expect(sameOrigin.status).toBe(200);
+
+    // Cross-site write is rejected.
+    const evil = await request(app)
+      .post("/api/bot/clear-logs")
+      .set("Cookie", cookie)
+      .set("Origin", "https://evil.example");
+    expect(evil.status).toBe(403);
+  });
+
+  it("still authenticates tooling via bearer token", async () => {
+    const res = await request(app).get("/api/bot/status").set(auth);
+    expect(res.status).toBe(200);
   });
 });
 
@@ -117,15 +175,14 @@ describe("Command registry", () => {
     expect(names).toContain("help");
   });
 
-  it("saves a command to disk and hot-loads it into the registry", async () => {
-    // Self-contained command (no relative imports) so it loads from the temp dir.
+  it("saves a panel command as data and executes it in the sandbox", async () => {
     const code = `const cmd = {
   name: "hellocmd",
   category: "Test",
   description: "Test command saved via API",
   usage: "hellocmd",
   execute: async (_sock, _msg, context) => {
-    await context.reply("Hello from disk!");
+    await context.reply("Hello from sandbox!");
   }
 };
 
@@ -138,8 +195,11 @@ export default cmd;
     expect(save.status).toBe(200);
     expect(save.body.loaded).toBe(true);
 
+    // C4: nothing executable may be written into the source tree.
     const filePath = path.join(commandsDir, "hellocmd.ts");
-    expect(fs.existsSync(filePath)).toBe(true);
+    const compiledPath = path.join(commandsDir, ".compiled", "hellocmd.mjs");
+    expect(fs.existsSync(filePath)).toBe(false);
+    expect(fs.existsSync(compiledPath)).toBe(false);
 
     const list = await request(app).get("/api/bot/commands").set(auth);
     expect(list.body.some((c: { name: string }) => c.name === "hellocmd")).toBe(true);
@@ -149,7 +209,7 @@ export default cmd;
       .set(auth)
       .send({ senderName: "Tester", text: ".hellocmd" });
     expect(sim.status).toBe(200);
-    expect(sim.body.text).toContain("Hello from disk!");
+    expect(sim.body.text).toContain("Hello from sandbox!");
   });
 
   it("rejects empty or invalid command names", async () => {
@@ -206,6 +266,7 @@ const zipai: BotCommand = {
 
 export default zipai;
 `;
+    fs.mkdirSync(commandsDir, { recursive: true });
     fs.writeFileSync(path.join(commandsDir, "zipai.ts"), aiLike, "utf-8");
 
     const res = await request(app).get("/api/bot/download-zip").set(auth).responseType("arraybuffer");
@@ -248,7 +309,9 @@ describe("Gemini endpoints", () => {
   });
 
   it("rejects oversized audio payloads (413)", async () => {
-    const huge = "A".repeat(26 * 1024 * 1024); // > 25mb body limit
+    // 31 MiB of base64: under the 32 MiB JSON body limit, but over the
+    // route's 30M-char audio cap -> the explicit friendly 413 must fire.
+    const huge = "A".repeat(31 * 1024 * 1024);
     const res = await request(app)
       .post("/api/gemini/transcribe")
       .set(auth)
@@ -388,6 +451,193 @@ describe("System and commands checkup diagnostics", () => {
     expect(Array.isArray(res.body.tests)).toBe(true);
     expect(res.body.tests.length).toBeGreaterThan(0);
     expect(Array.isArray(res.body.dependencies)).toBe(true);
+
+    // M9: network probes are opt-in — the default suite must be offline-safe.
+    const names = res.body.tests.map((t: any) => t.name);
+    expect(names).not.toContain("Weather API Integration");
+
+    // M12: vendor breakage must be visible, not silent.
+    const bridge = res.body.tests.find((t: any) => t.name === "Vendored Command Bridge");
+    expect(bridge).toBeDefined();
+    expect(typeof bridge.details.skipped).toBe("number");
   });
 });
 
+
+describe("RoleGuard access control API", () => {
+  it("requires auth and returns policy index", async () => {
+    const unauth = await request(app).get("/api/bot/access");
+    expect(unauth.status).toBe(401);
+
+    const res = await request(app).get("/api/bot/access").set(auth);
+    expect(res.status).toBe(200);
+    expect(res.body.policies).toBeDefined();
+    expect(res.body.defaults).toBeDefined();
+    expect(res.body.commandIndex.length).toBeGreaterThan(0);
+  });
+
+  it("persists and returns a sanitized group policy", async () => {
+    const groupJid = "120363012345678901@g.us";
+    const save = await request(app)
+      .post(`/api/bot/access/${groupJid}`)
+      .set(auth)
+      .send({
+        defaultTo: "deny",
+        memberDeny: ["kick", "promote", 42, null],
+        memberAllow: ["menu", "help"],
+        adminAllow: ["download"],
+      });
+    expect(save.status).toBe(200);
+    expect(save.body.policy.defaultTo).toBe("deny");
+    expect(save.body.policy.memberDeny).toEqual(["kick", "promote"]);
+    expect(save.body.policy.memberAllow).toEqual(["menu", "help"]);
+    expect(save.body.policy.adminAllow).toEqual(["download"]);
+
+    // The group list endpoint reflects the new policy.
+    const list = await request(app).get("/api/bot/access").set(auth);
+    expect(list.body.policies[groupJid]).toBeDefined();
+    expect(list.body.policies[groupJid].defaultTo).toBe("deny");
+
+    // And the single-group GET returns it too.
+    const one = await request(app).get(`/api/bot/access/${groupJid}`).set(auth);
+    expect(one.status).toBe(200);
+    expect(one.body.policy.memberDeny).toContain("kick");
+  });
+
+  it("rejects invalid mode and overly long input gracefully", async () => {
+    const groupJid = "120363099999999999@g.us";
+    const bad = await request(app)
+      .post(`/api/bot/access/${groupJid}`)
+      .set(auth)
+      .send({ defaultTo: "maybe", memberDeny: [Array(10000).fill("x").join("")] });
+    expect(bad.status).toBe(200); // sanitize falls back to allow mode
+    expect(bad.body.policy.defaultTo).toBe("allow");
+    expect(bad.body.policy.memberDeny.length).toBeLessThanOrEqual(200);
+  });
+});
+
+describe("Panel command execution safety (C4)", () => {
+  const BENIGN = `
+import { BotCommand } from "../types.js";
+const cmd: BotCommand = {
+  name: "safesay",
+  category: "Utility",
+  description: "Safe test command",
+  execute: async (_s, _m, context) => {
+    await context.reply("safe!");
+  },
+};
+export default cmd;
+`;
+
+  it("rejects panel command source that imports node built-ins", async () => {
+    const res = await request(app)
+      .post("/api/bot/commands/save")
+      .set(auth)
+      .send({ name: "evilcmd", code: 'import fs from "fs"; export default {};' });
+    expect(res.status).toBe(400);
+    expect(res.body.ok ?? res.body.success).toBeFalsy();
+    expect(res.body.error).toMatch(/not allowed|Forbidden/i);
+  });
+
+  it("rejects panel command source that references process", async () => {
+    const res = await request(app)
+      .post("/api/bot/commands/save")
+      .set(auth)
+      .send({ name: "evilcmd2", code: "export default {}; console.log(process.env);" });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/Forbidden/i);
+  });
+
+  it("stores and loads a benign panel command as data (no disk module)", async () => {
+    const name = "safesay";
+    const save = await request(app)
+      .post("/api/bot/commands/save")
+      .set(auth)
+      .send({ name, code: BENIGN });
+    expect(save.status).toBe(200);
+    expect(save.body.success).toBe(true);
+    expect(save.body.loaded).toBe(true);
+
+    // Source round-trips via the API.
+    const detail = await request(app).get(`/api/bot/commands/${name}`).set(auth);
+    expect(detail.status).toBe(200);
+    expect(detail.body.code).toContain("safe!");
+
+    // Downstream effects must NOT include an executable module on disk.
+    const fsMod = await import("fs");
+    const pathMod = await import("path");
+    const legacyTs = pathMod.join(commandsDir, `${name}.ts`);
+    const legacyMjs = pathMod.join(commandsDir, ".compiled", `${name}.mjs`);
+    expect(fsMod.existsSync(legacyTs)).toBe(false);
+    expect(fsMod.existsSync(legacyMjs)).toBe(false);
+  });
+});
+
+describe("Host header validation (M3)", () => {
+  it("rejects foreign Host headers when APP_URL is configured", async () => {
+    const previous = process.env.APP_URL;
+    process.env.APP_URL = "https://panel.example.com";
+    try {
+      const { createApp: createAppWithHost } = await import("../app.js");
+      const appWithHost = createAppWithHost();
+
+      const bad = await request(appWithHost).get("/api/bot/status").set("Host", "evil.example").set(auth);
+      expect(bad.status).toBe(400);
+      expect(bad.body.error).toBe("Invalid Host header.");
+
+      const good = await request(appWithHost).get("/api/bot/status").set("Host", "panel.example.com").set(auth);
+      expect(good.status).toBe(200);
+    } finally {
+      if (previous === undefined) delete process.env.APP_URL;
+      else process.env.APP_URL = previous;
+    }
+  });
+});
+
+describe("Health, audit trail and backup (M13/§8)", () => {
+  it("serves a public health probe without auth", async () => {
+    const res = await request(app).get("/api/health");
+    expect(res.status).toBe(200);
+    expect(res.body.status).toBe("ok");
+    expect(typeof res.body.commands).toBe("number");
+    expect(res.body.aiUsage).toBeDefined();
+  });
+
+  it("returns and clears the audit trail only when authenticated", async () => {
+    const unauth = await request(app).get("/api/bot/audit");
+    expect(unauth.status).toBe(401);
+
+    // Login writes audit events; the API should show at least one.
+    await request(app).post("/api/auth/login").send({ token: "test-panel-token" });
+    const res = await request(app).get("/api/bot/audit").set(auth);
+    expect(res.status).toBe(200);
+    expect(Array.isArray(res.body.events)).toBe(true);
+    expect(res.body.events.length).toBeGreaterThan(0);
+    expect(res.body.events[0].action).toMatch(/auth\./);
+  });
+
+  it("export backup is sanitized (no sessionString) and restore validates format", async () => {
+    const backup = await request(app).get("/api/bot/backup").set(auth);
+    expect(backup.status).toBe(200);
+    expect(backup.body.format).toBe("nebula-backup@1");
+    expect(backup.body.config).toBeDefined();
+    expect(JSON.stringify(backup.body)).not.toContain("sessionString");
+
+    // Restore accepts our own bundle.
+    const restore = await request(app)
+      .post("/api/bot/backup/restore")
+      .set(auth)
+      .send(backup.body);
+    expect(restore.status).toBe(200);
+    expect(restore.body.success).toBe(true);
+    expect(restore.body.applied).toContain("config");
+
+    // Foreign format is rejected.
+    const bad = await request(app)
+      .post("/api/bot/backup/restore")
+      .set(auth)
+      .send({ format: "something-else", config: {} });
+    expect(bad.status).toBe(400);
+  });
+});

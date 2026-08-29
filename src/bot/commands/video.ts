@@ -71,10 +71,19 @@ const videoCommand: BotCommand = {
       }
 
       const rawUrl = args.join(" ").trim();
-      
-      // Basic URL verification
-      if (!ytdl.validateURL(rawUrl) && !rawUrl.includes("youtu.be") && !rawUrl.includes("youtube.com")) {
+
+      // Strict host allowlist (rejects look-alike hosts such as
+      // "youtube.com.evil.example") and SSRF guard before any fetch.
+      let parsedUrl: URL;
+      try {
+        parsedUrl = new URL(/^https?:\/\//i.test(rawUrl) ? rawUrl : `https://${rawUrl}`);
+      } catch {
         await context.reply("❌ *Error:* Invalid YouTube URL. Please provide a valid watch or short URL.");
+        return;
+      }
+      const allowedHosts = new Set(["youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be", "music.youtube.com"]);
+      if (!allowedHosts.has(parsedUrl.hostname.toLowerCase()) || !(await isSafeDownloadUrl(parsedUrl.toString()))) {
+        await context.reply("❌ *Error:* Invalid or blocked YouTube URL. Please provide a valid watch or short URL.");
         return;
       }
 

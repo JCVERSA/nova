@@ -1,5 +1,6 @@
 import { BotCommand } from "../types.js";
 import { generateTextWithFallback } from "../geminiClient.js";
+import { checkAIQuota, consumeAIQuota, withAIConcurrency } from "../aiQuota.js";
 
 const aiCommand: BotCommand = {
   name: "ai",
@@ -25,11 +26,20 @@ const aiCommand: BotCommand = {
       return;
     }
 
+    const quota = checkAIQuota(context.sender);
+    if (!quota.allowed) {
+      await context.reply(`⚠️ ${quota.error}`);
+      return;
+    }
+
     try {
-      const answer = await generateTextWithFallback(
-        prompt,
-        "You are Nebula Bot, an advanced WhatsApp multi-device bot assistant. Keep responses helpful, structured, concise, and clean for a messaging app interface. Use bolding, bullet points, and emojis appropriately.",
-        "gemini-3.7-flash"
+      consumeAIQuota(context.sender);
+      const answer = await withAIConcurrency(() =>
+        generateTextWithFallback(
+          prompt,
+          "You are Nebula Bot, an advanced WhatsApp multi-device bot assistant. Keep responses helpful, structured, concise, and clean for a messaging app interface. Use bolding, bullet points, and emojis appropriately.",
+          "gemini-3.7-flash"
+        )
       );
       await context.reply(`🌌 *Nebula AI Assistant*\n\n${answer}`);
     } catch (error: any) {
